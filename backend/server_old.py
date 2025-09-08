@@ -2,27 +2,37 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import hashlib
+import jwt
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
+import json
 import PyPDF2
 import io
+from sentence_transformers import SentenceTransformer
+import numpy as np
 import google.generativeai as genai
-
-# Import our lightweight modules
-from database import db
-from lightweight_embeddings import embeddings_engine
+from sklearn.metrics.pairwise import cosine_similarity
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+# Initialize embedding model
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
 # Configure Gemini
-genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
+genai.configure(api_key="AIzaSyA3dRlGjSFwwKjCnq1vgaHfrMx36mJE22c")
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
 # Create the main app
@@ -111,21 +121,32 @@ def chunk_text(text: str, chunk_size: int = 500) -> List[str]:
     return chunks
 
 def get_embeddings(texts: List[str]) -> List[List[float]]:
-    return embeddings_engine.get_embeddings_tfidf(texts)
+    embeddings = embedding_model.encode(texts)
+    return embeddings.tolist()
 
 def find_relevant_chunks(query: str, document_chunks: List[str], document_embeddings: List[List[float]], top_k: int = 3) -> List[dict]:
-    return embeddings_engine.find_relevant_chunks(query, document_chunks, document_embeddings, top_k)
-
-# Initialize database on startup
-@app.on_event("startup")
-async def startup_db():
-    await db.init_db()
+    query_embedding = embedding_model.encode([query])
+    similarities = cosine_similarity(query_embedding, document_embeddings)[0]
+    
+    # Get top k most similar chunks
+    top_indices = np.argsort(similarities)[-top_k:][::-1]
+    
+    results = []
+    for idx in top_indices:
+        if similarities[idx] > 0.3:  # Minimum similarity threshold
+            results.append({
+                'chunk_index': int(idx),
+                'content': document_chunks[idx],
+                'relevance_score': float(similarities[idx])
+            })
+    
+    return results
 
 # SIMPLIFIED Authentication endpoints
 @api_router.post("/auth/register")
 async def register(user_data: UserCreate):
     # Check if user exists
-    existing_user = await db.get_user_by_username(user_data.username)
+    existing_user = await db.users.find_one({"username": user_data.username})
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already exists")
     
@@ -141,10 +162,7 @@ async def register(user_data: UserCreate):
         "created_at": datetime.utcnow()
     }
     
-    success = await db.create_user(user)
-    if not success:
-        raise HTTPException(status_code=400, detail="Failed to create user")
-    
+    await db.users.insert_one(user)
     token = create_token(user_id)
     
     return {
@@ -158,7 +176,7 @@ async def register(user_data: UserCreate):
 @api_router.post("/auth/login")
 async def login(user_data: UserLogin):
     # Find user
-    user = await db.get_user_by_username(user_data.username)
+    user = await db.users.find_one({"username": user_data.username})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or password")
     
@@ -210,9 +228,7 @@ async def upload_document(
         "status": "completed"
     }
     
-    success = await db.create_document(document)
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to save document")
+    await db.documents.insert_one(document)
     
     return {"message": "Document uploaded and processed successfully", "document_id": doc_id}
 
@@ -243,22 +259,30 @@ async def add_text_document(
         "status": "completed"
     }
     
-    success = await db.create_document(document)
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to save document")
+    await db.documents.insert_one(document)
     
     return {"message": "Text document processed successfully", "document_id": doc_id}
 
 @api_router.get("/documents")
 async def get_documents(user_id: str = Depends(get_current_user)):
-    documents = await db.get_user_documents(user_id)
+    documents = await db.documents.find(
+        {"user_id": user_id}
+    ).to_list(100)
+    
+    # Remove heavy fields for response
+    for doc in documents:
+        doc.pop("content", None)
+        doc.pop("chunks", None) 
+        doc.pop("embeddings", None)
+        doc.pop("_id", None)
+    
     return documents
 
 # Query endpoint
 @api_router.post("/query", response_model=QueryResponse)
 async def query_documents(query: QueryRequest, user_id: str = Depends(get_current_user)):
     # Get user documents
-    documents = await db.get_user_documents_with_content(user_id)
+    documents = await db.documents.find({"user_id": user_id}).to_list(100)
     
     if not documents:
         raise HTTPException(status_code=400, detail="No documents found. Please upload some documents first.")
@@ -324,7 +348,7 @@ async def external_query(
     question: str = Form(...)
 ):
     # Find user by API key
-    user = await db.get_user_by_api_key(api_key)
+    user = await db.users.find_one({"api_key": api_key})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API key")
     
@@ -346,3 +370,7 @@ app.add_middleware(
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
