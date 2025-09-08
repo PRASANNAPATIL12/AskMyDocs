@@ -315,6 +315,21 @@ async def external_query(
 # Include the router in the main app
 app.include_router(api_router)
 
+# Root endpoint
+@app.get("/")
+async def root():
+    return {
+        "message": "DocuBrain API is running! 🧠",
+        "version": "1.0.0",
+        "endpoints": {
+            "register": "POST /api/auth/register",
+            "login": "POST /api/auth/login", 
+            "upload": "POST /api/documents/upload",
+            "query": "POST /api/query",
+            "docs": "/docs"
+        }
+    }
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
