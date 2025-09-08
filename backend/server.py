@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 import os
 import logging
-import hashlib
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -39,23 +38,6 @@ class UserLogin(BaseModel):
     username: str
     password: str
 
-class User(BaseModel):
-    user_id: str
-    username: str
-    api_key: str
-    created_at: datetime
-
-class Document(BaseModel):
-    id: str
-    user_id: str
-    filename: str
-    content: str
-    chunks: List[str]
-    embeddings: List[List[float]]
-    upload_time: datetime
-    chunk_count: int
-    status: str
-
 class QueryRequest(BaseModel):
     question: str
 
@@ -64,15 +46,12 @@ class QueryResponse(BaseModel):
     sources: List[dict]
 
 # Utility functions - SIMPLIFIED
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
 def create_token(user_id: str) -> str:
     # Super simple token - just prefix + user_id
     return f"simple_token_{user_id}"
 
 def verify_token(token: str) -> str:
-    # Super simple token verification - just check if it starts with our prefix
+    # Super simple token verification
     if token and token.startswith("simple_token_"):
         return token.replace("simple_token_", "")
     raise HTTPException(status_code=401, detail="Invalid token")
@@ -110,18 +89,12 @@ def chunk_text(text: str, chunk_size: int = 500) -> List[str]:
     
     return chunks
 
-def get_embeddings(texts: List[str]) -> List[List[float]]:
-    return embeddings_engine.get_embeddings_tfidf(texts)
-
-def find_relevant_chunks(query: str, document_chunks: List[str], document_embeddings: List[List[float]], top_k: int = 3) -> List[dict]:
-    return embeddings_engine.find_relevant_chunks(query, document_chunks, document_embeddings, top_k)
-
 # Initialize database on startup
 @app.on_event("startup")
-async def startup_db():
+async def startup_event():
     await db.init_db()
 
-# SIMPLIFIED Authentication endpoints
+# Authentication endpoints
 @api_router.post("/auth/register")
 async def register(user_data: UserCreate):
     # Check if user exists
@@ -129,7 +102,7 @@ async def register(user_data: UserCreate):
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already exists")
     
-    # Create new user - SIMPLE STORAGE
+    # Create new user
     user_id = str(uuid.uuid4())
     api_key = f"sk-docubrain-{uuid.uuid4().hex[:20]}"
     
@@ -192,9 +165,9 @@ async def upload_document(
     if not text.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from PDF")
     
-    # Process document
+    # Process document with lightweight embeddings
     chunks = chunk_text(text)
-    embeddings = get_embeddings(chunks)
+    embeddings = embeddings_engine.get_embeddings_tfidf(chunks)
     
     # Save to database
     doc_id = str(uuid.uuid4())
@@ -225,9 +198,9 @@ async def add_text_document(
     if not content.strip():
         raise HTTPException(status_code=400, detail="Content cannot be empty")
     
-    # Process text
+    # Process text with lightweight embeddings
     chunks = chunk_text(content)
-    embeddings = get_embeddings(chunks)
+    embeddings = embeddings_engine.get_embeddings_tfidf(chunks)
     
     # Save to database
     doc_id = str(uuid.uuid4())
@@ -257,17 +230,17 @@ async def get_documents(user_id: str = Depends(get_current_user)):
 # Query endpoint
 @api_router.post("/query", response_model=QueryResponse)
 async def query_documents(query: QueryRequest, user_id: str = Depends(get_current_user)):
-    # Get user documents
+    # Get user documents with content
     documents = await db.get_user_documents_with_content(user_id)
     
     if not documents:
         raise HTTPException(status_code=400, detail="No documents found. Please upload some documents first.")
     
-    # Find relevant chunks across all documents
+    # Find relevant chunks across all documents using lightweight embeddings
     all_relevant_chunks = []
     
     for doc in documents:
-        relevant_chunks = find_relevant_chunks(
+        relevant_chunks = embeddings_engine.find_relevant_chunks(
             query.question, 
             doc["chunks"], 
             doc["embeddings"]
@@ -290,7 +263,8 @@ async def query_documents(query: QueryRequest, user_id: str = Depends(get_curren
     # Create context for Gemini
     context = "\n\n".join([chunk['content'] for chunk in top_chunks])
     
-    prompt = f"""Based on the following context from the user's documents, answer the question. Only use information from the provided context.
+    # Efficient prompt to minimize token usage
+    prompt = f"""Based on the context below, answer the question concisely. Use only the provided information.
 
 Context:
 {context}
@@ -300,7 +274,13 @@ Question: {query.question}
 Answer:"""
     
     try:
-        response = gemini_model.generate_content(prompt)
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=200,  # Limit response length for efficiency
+                temperature=0.3  # Lower temperature for more focused responses
+            )
+        )
         answer = response.text
     except Exception as e:
         answer = f"Error generating response: {str(e)}"
@@ -349,4 +329,4 @@ logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
